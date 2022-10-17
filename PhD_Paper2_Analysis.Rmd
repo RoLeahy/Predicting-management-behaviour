@@ -1,0 +1,1485 @@
+---
+title: "Predicting Concussion Management Behaviour in LGF Players- Analysis"
+author: "Róisín Leahy"
+date: "7/9/2021"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)  #For data cleaning and plots
+library(knitr)      #To create tables
+library(janitor)    #To create frequency tables
+library(table1)     #To create tables of descriptive statistics
+library(flextable)  #To edit tables
+library(officer)    #To export tables
+library(nnet)       #For multinomial logistic regression
+library(MASS)       #For backward stepwise regression
+library(broom)      #To summarize model information
+library(lmtest)
+library(pscl)       #To calculate pseudo-R2
+library(car)        #To examine regression assumptions
+
+setwd("C:/Users/roisi/OneDrive/Documents/PhD/PhD_Data/PhD_Data_S2")
+
+S2_survey_all<-readRDS("PhD_Data_S2_all_3.rds")
+glimpse(S2_survey_all)
+
+S2_survey_src<-readRDS("PhD_Data_S2_src_3.rds")
+glimpse(S2_survey_src)
+
+S2_survey_all<-S2_survey_all %>%
+  mutate(ConLGF_Dx=case_when(
+    ConHx_Dx_2019=="Yes" ~ "Diagnosed SRC in 2019",
+    ConHx_Dx_2019=="No" ~ "Suspected SRC in 2019",
+    ConHx_Dx_2019=="Don't remember" ~ as.character(NA),
+    TRUE ~ as.character("No SRC in 2019")))
+
+```
+### Demographic characteristics
+
+```{r DemographicCharacteristics}
+
+levels(S2_survey_all$ConLGF_2019)<-c("No Concussion in 2019 Group","Concussion in 2019 Group")
+levels(S2_survey_all$Dem_County)<-c("Non-Elite","Elite")
+S2_survey_all$Dem_County<-S2_survey_all$Dem_County %>% fct_relevel("Elite","Non-Elite")
+S2_survey_all$ConHx_yes_no<-S2_survey_all$ConHx_yes_no %>% fct_relevel("Yes","No")
+S2_survey_all$ConEd<-S2_survey_all$ConEd %>% fct_relevel("Yes","No")
+
+table1::label(S2_survey_all$Dem_County)<-c("Level of play, % (n)")
+table1::label(S2_survey_all$Dem_Age)<-"Age, median (IQR)"
+table1::label(S2_survey_all$Dem_Years_Play)<-"Number of Years Playing Experience, median (IQR)"
+table1::label(S2_survey_all$Dem_Pos)<-"Playing Position, % (n)"
+table1::label(S2_survey_all$Dem_Reg)<-"Region, % (n)"
+table1::label(S2_survey_all$ConHx_yes_no)<-"Previous Self-Reported Concussion, % (n)"
+table1::label(S2_survey_all$ConEd)<-"Previous Use of LGFA Concussion Education Resources"
+
+render_cont<-function(x){with(stats.apply.rounding(stats.default(x), digits=2), c("Median (IQR)"=sprintf("%s (%s)", MEDIAN, IQR)))}
+
+render_categor<-function(x){c("",sapply(stats.default(x),function(y) with(y,sprintf("%0.1f%% (%d)",PCT, FREQ))))}
+
+##Concussion & no concussion groups
+dem_t1<-table1(~ Dem_County + Dem_Age + Dem_Years_Play + Dem_Pos + Dem_Reg + ConHx_yes_no + ConEd| ConLGF_2019, data=S2_survey_all, overall="Total Sample",
+        render.continuous=render_cont,
+        render.categorical=render_categor)
+dem_t1
+
+set_flextable_defaults(font.family="Times",font.size=8,border.color="black")
+dem_t1<-t1flex(dem_t1)
+dem_t1<-italic(dem_t1,part="header")
+dem_t1<-bold(dem_t1,part="header")
+dem_t1<-border_remove(dem_t1)
+dem_t1<-hline_top(dem_t1,border=fp_border(width=0.5))
+dem_t1
+
+##Diagnosed SRC, suspected SRC, & no SRC groups
+S2_survey_all$ConLGF_Dx<-factor(S2_survey_all$ConLGF_Dx,levels=c("Diagnosed SRC in 2019","Suspected SRC in 2019","No SRC in 2019"))
+
+dem_t2<-table1(~ Dem_County + Dem_Age + Dem_Years_Play + Dem_Pos + Dem_Reg + ConHx_yes_no + ConEd| ConLGF_Dx, data=S2_survey_all, overall="Total Sample",
+        render.continuous=render_cont,
+        render.categorical=render_categor)
+dem_t2
+
+set_flextable_defaults(font.family="Times",font.size=8,border.color="black")
+dem_t2<-t1flex(dem_t2)
+dem_t2<-italic(dem_t2,part="header")
+dem_t2<-bold(dem_t2,part="header")
+dem_t2<-border_remove(dem_t2)
+dem_t2<-hline_top(dem_t2,border=fp_border(width=0.5))
+dem_t2
+
+```
+
+### Factors Associated with Concussion Management Behaviour
+
+* Multinomial logistic regression to examine time spent playing on
+* Logistic regression to examine 
+
+Ten events-per-variable are required. 
+
+```{r Planning Models, echo=FALSE}
+
+map(S2_survey_src,table)
+DVs_EVPs<-data.frame(model=c("ToldCoach","SameDayRTP", "SympRTP",
+                             "RTPProg","MedSupRTP","MedClear",
+                             "RTS"),
+                     least_freq=c(52,43,45,40,32,28,18),
+                     vars=c("5","4","4","4","3","2-3","1-2"))
+kable(DVs_EVPs,align="l")
+```
+
+#### Multinomial Logistic Regression: Factors associated with immediate response (playing on) after an SRC
+
+Possible IVs:
+- Level of play
+- Age
+- Number of years playing
+- Concussion history (SRC and non-SRC)
+- Concussion knowledge
+- Concussion attitude
+- Previous use of LGFA concussion education material
+
+Method 1: Examine univariate associations and only include significant variables in model (p<0.25) 
+
+```{r Multinomial_Logistic_Regression}
+
+levels(S2_survey_src$ConHx_ImmRes_2019)
+
+#Univariate analysis
+##Playing level
+mn_uni_1<-multinom(ConHx_ImmRes_2019 ~ Dem_County, data=S2_survey_src)
+tidy(mn_uni_1)
+
+##Age
+mn_uni_2<-multinom(ConHx_ImmRes_2019 ~ Dem_Age, data=S2_survey_src)
+tidy(mn_uni_2)
+
+##Number of years played
+mn_uni_3<-multinom(ConHx_ImmRes_2019 ~ Dem_Years_Play, data=S2_survey_src)
+tidy(mn_uni_3)
+
+##Concussion history
+mn_uni_4<-multinom(ConHx_ImmRes_2019 ~ ConHx_yes_no, data=S2_survey_src)
+tidy(mn_uni_4)
+
+##Concussion knowledge
+mn_uni_5<-multinom(ConHx_ImmRes_2019 ~ RoCKAS_CKI, data=S2_survey_src)
+tidy(mn_uni_5)
+
+##Concussion attitude
+mn_uni_6<-multinom(ConHx_ImmRes_2019 ~ RoCKAS_CAI, data=S2_survey_src)
+tidy(mn_uni_6)
+
+##Concussion education
+mn_uni_7<-multinom(ConHx_ImmRes_2019 ~ ConEd, data=S2_survey_src)
+tidy(mn_uni_7)
+
+##Variables meeting p<0.25 cut-off:
+#Level- played for >15 minutes compared with did not play
+#Concussion history- played for <15 minutes compared with did not play
+#Concussion attitude- played for >15 minutes compared with did not play
+
+mn_1<-multinom(ConHx_ImmRes_2019 ~ Dem_County + ConHx_yes_no + RoCKAS_CAI, data=S2_survey_src)
+tidy(mn_1,conf.int=TRUE,exponentiate=TRUE)
+
+####Goodness of Fit####
+##Likelihood Ratio test
+##H0: there is no difference between the full and intercept only models
+##H1: there is a difference between the full and intercept only models
+mn_1_intercept<-multinom(ConHx_ImmRes_2019 ~ 1, data=S2_survey_src)
+lrtest(mn_1,mn_1_intercept)
+
+##Pseudo-R Squared
+pR2(mn_1)
+
+####Assumptions####
+##Linearity
+S2_survey_src$RoCKAS_CAIlog<-log(S2_survey_src$RoCKAS_CAI)*S2_survey_src$RoCKAS_CAI
+S2_survey_src$RoCKAS_CKIlog<-log(S2_survey_src$RoCKAS_CKI)*S2_survey_src$RoCKAS_CKI
+
+toldcoach_glm_assump<-glm(ConHx_ToldCoach_2019 ~ ConHx_yes_no + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CKIlog, data=S2_survey_src, family=binomial)
+tidy(toldcoach_glm_assump)
+
+#Assumption 2: No outliers
+#Standardized residuals >3 suggest outliers
+#plot(toldcoach_glm_2,which=4,id.n=3)
+#toldcoach_glm2_data<-augment(toldcoach_glm_2) %>%
+ # mutate(index=1:n())
+#toldcoach_glm2_data %>% top_n(3,.cooksd)
+
+#toldcoach_glm2_data$.std.resid
+#toldcoach_glm2_assump_p1<-ggplot(toldcoach_glm2_data,aes(index,.std.resid))+
+  #geom_point(aes(color=ConHx_ToldCoach_2019),alpha=0.5)
+
+summary(mn_1)
+
+#Assumption 3: Multicollinearity
+#VIF >5 suggests multicollinearity
+
+####Tables####
+mn_1_dat<-mn_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate_at(c("estimate","std.error","statistic","conf.low","conf.high"),~round(.,2)) %>%
+  unite("95CI",conf.low:conf.high,sep="-",remove=TRUE)  
+mn_1_dat$coef<-round(tidy(mn_1)$estimate,2)
+mn_1_dat$'95CI'<-paste0("(",mn_1_dat$'95CI',")")
+
+mn_1_dat<-mn_1_dat %>% 
+  dplyr::select(y.level,term,coef,std.error,estimate,'95CI',p.value) %>%
+  mutate_at("p.value",~round(.,3)) %>%
+  unite(odds.ratio,estimate:`95CI`,sep=" ",remove=TRUE) 
+colnames(mn_1_dat)<-c("Level","Term","Beta","Standard Error","Odds Ratio (95% CI)","P-value")
+mn_1_dat$Term<-c("Intercept","Elite level (yes)","Concussion history (yes)","Concussion attitude","Intercept","Elite level (yes)","Concussion history (yes)","Concussion attitude")
+
+mn_1_dat<-mn_1_dat %>%
+  add_row(Term="Played for less than 15 minutes",.before=1) %>%
+  add_row(Term="Played for more than 15 minutes",.before=6) %>%
+  dplyr::select(-Level)
+mn_1_dat
+
+mn_1_ft<-flextable(mn_1_dat)
+mn_1_ft<-flextable::align(mn_1_ft,align="center",part="all")
+mn_1_ft<-flextable::align(mn_1_ft,j=1,align="left")
+mn_1_ft<-bold(mn_1_ft,part="header")
+mn_1_ft<-italic(mn_1_ft,i=c(1,6))
+mn_1_ft<-border_remove(mn_1_ft)
+mn_1_ft<-hline_top(mn_1_ft,part="all",border=fp_border(width=0.5))
+mn_1_ft<-hline_bottom(mn_1_ft,border=fp_border(width=0.5))
+mn_1_ft<-merge_h_range(mn_1_ft,i=c(1,6),j1=1,j2=5)
+mn_1_ft<-autofit(mn_1_ft)
+mn_1_ft
+
+####Plots####
+mn_1_plot_df<-mn_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate(term=factor(term,levels=c("(Intercept)","Dem_CountyYes","ConHx_yes_noYes","RoCKAS_CAI"),labels=c("Intercept","Elite level","Previous concussion","Attitude score"))) %>%
+  mutate(estimate2=if_else(p.value<0.05,"*","")) %>%
+  slice(2:4,6:8)
+mn_1_plot_df
+
+annot<-data.frame(estimate=6,term=0.65,label="LRT: p=0.049",y.level=factor("Played for >15 mins",levels=c("Played for <15 mins","Played for >15 mins")))
+
+mn_p1<-ggplot(mn_1_plot_df,aes(x=estimate,y=term,color=y.level)) +
+  geom_point(shape=18,size=3) +
+  geom_errorbar(aes(xmin=conf.low,xmax=conf.high),width=0.1) +
+  geom_vline(xintercept=1) +
+  scale_y_discrete(limits=rev) +
+  facet_wrap(vars(y.level)) +
+  xlab("Odds Ratios with 95% Confidence Intervals") + ylab("Factors") +
+  scale_color_brewer(palette="Dark2") +
+  geom_text(aes(label=round(estimate,digits=2)),nudge_x=1,nudge_y=0.15) +
+  geom_text(aes(label=estimate2),nudge_x=1.6,nudge_y=0.15) +
+  geom_text(data=annot,label="LRT: p=0.049") +
+  #annotate("text",x=6,y=0.5,label="LRT: p=0.049") +
+  theme_classic() +
+  theme(plot.title=element_text(size=12)) +
+  theme(legend.position="none") +
+  labs(title="Factors associated with continuing to play following \na suspected concussion") 
+mn_p1
+ggsave("manag_p1.png",width=6,height=4,units="in")
+
+forestplot_fun<-function(df){
+  ggplot(df,aes(x=estimate,y=term)) +
+  geom_point(shape=18,size=3,colour="#7570B3") +
+  geom_errorbar(aes(xmin=conf.low,xmax=conf.high),width=0.1,colour="#7570B3") +
+  geom_vline(xintercept=1) +
+  scale_y_discrete(limits=rev) +
+  xlab("Odds Ratios with 95% Confidence Intervals") + ylab("Factors") +
+   theme_classic()}
+```
+
+#### Model 1: Factors associated with informing coach of suspected SRC (max of 5 IVs)
+
+Possible IVs:
+- Level of play
+- Age
+- Number of years playing
+- Concussion history (SRC and non-SRC)
+- Diagnosis for SRC of interest
+- Concussion knowledge
+- Concussion attitude
+- Previous use of LGFA concussion education material
+
+Method 1: Examine univariate associations and only include significant variables in model (p<0.25) 
+```{r Logistic_Regression1_Univariate_Analysis}
+
+#Reorder levels
+S2_survey_src$ConHx_ToldCoach_2019<-S2_survey_src$ConHx_ToldCoach_2019 %>% fct_relevel("No","Yes")
+
+#Univariate analysis
+##Playing level
+m1_uni_1<-glm(ConHx_ToldCoach_2019 ~ Dem_County, data=S2_survey_src, family=binomial)
+tidy(m1_uni_1)
+##Age
+m1_uni_2<-glm(ConHx_ToldCoach_2019 ~ Dem_Age, data=S2_survey_src, family=binomial)
+tidy(m1_uni_2)
+##Number of years played
+m1_uni_3<-glm(ConHx_ToldCoach_2019 ~ Dem_Years_Play, data=S2_survey_src, family=binomial)
+tidy(m1_uni_3)
+##Concussion history
+m1_uni_4<-glm(ConHx_ToldCoach_2019 ~ ConHx_yes_no, data=S2_survey_src, family=binomial)
+tidy(m1_uni_4)
+##CKI
+m1_uni_5<-glm(ConHx_ToldCoach_2019 ~ RoCKAS_CKI, data=S2_survey_src, family=binomial)
+tidy(m1_uni_5)
+##CAI
+m1_uni_6<-glm(ConHx_ToldCoach_2019 ~ RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m1_uni_6)
+##Concussion education
+m1_uni_7<-glm(ConHx_ToldCoach_2019 ~ ConEd, data=S2_survey_src, family=binomial)
+tidy(m1_uni_7)
+
+##Variables meeting p<0.25 cut-off:
+##Concussion history
+
+m1_glm_1<-glm(ConHx_ToldCoach_2019 ~ ConHx_yes_no, data=S2_survey_src, family=binomial)
+tidy(m1_glm_1,exponentiate=TRUE)
+
+#Goodness of fit
+##Likelihood ratio test
+##H0: there is no difference between the full and intercept only model
+##H1: there is a difference between the full and intercept only model
+m1_glm_1_intercept<-glm(ConHx_ToldCoach_2019 ~ 1, data=S2_survey_src, family=binomial)
+lrtest(m1_glm_1,m1_glm_1_intercept)
+
+#McFadden's pseudo-R
+pR2(m1_glm_1)
+
+#Assumptions
+#Outliers (standardized residuals >3)
+augment(m1_glm_1)$.std.resid[augment(m1_glm_1)$.std.resid>3]
+
+####3. Tables####
+m1_glm_1_dat<-m1_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate_at(c("estimate","std.error","statistic","conf.low","conf.high"),~round(.,2)) %>%
+  unite("95CI",conf.low:conf.high,sep="-",remove=TRUE)  
+m1_glm_1_dat$coef<-round(tidy(m1_glm_1)$estimate,2)
+m1_glm_1_dat$'95CI'<-paste0("(",m1_glm_1_dat$'95CI',")")
+
+m1_glm_1_dat<-m1_glm_1_dat %>% 
+  dplyr::select(term,coef,std.error,estimate,'95CI',p.value) %>%
+  mutate_at("p.value",~round(.,3)) %>%
+  unite(odds.ratio,estimate:`95CI`,sep=" ",remove=TRUE)
+m1_glm_1_dat$term<-c("Intercept","Concussion history (yes)")
+m1_glm_1_dat
+
+m1_glm_1_ft<-flextable(m1_glm_1_dat)
+m1_glm_1_ft<-set_header_labels(m1_glm_1_ft,term="Variable",coef="Beta",std.error="Standard Error",odds.ratio="Odds Ratio (95% CI)",p.value="P-value")
+m1_glm_1_ft<-flextable::align(m1_glm_1_ft,align="center",part="all")
+m1_glm_1_ft<-bold(m1_glm_1_ft,part="header")
+m1_glm_1_ft<-border_remove(m1_glm_1_ft)
+m1_glm_1_ft<-hline_top(m1_glm_1_ft,part="all",border=fp_border(width=0.5))
+m1_glm_1_ft<-hline_bottom(m1_glm_1_ft,border=fp_border(width=0.5))
+m1_glm_1_ft
+
+####Plots####
+m1_plot_df<-m1_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate(term=factor(term,levels=c("(Intercept)","ConHx_yes_noYes"),labels=c("Intercept","Previous concussion"))) %>%
+  mutate(estimate2=if_else(p.value<0.05,"*","")) %>%
+  slice(2)
+m1_plot_df
+
+m1_p<-forestplot_fun(m1_plot_df)
+m1_p<-m1_p +
+  geom_text(aes(label=round(estimate,digits=2)),nudge_x=0.6,nudge_y=0.05,colour="#7570B3") +
+  geom_text(aes(label=estimate2),nudge_x=0.9,nudge_y=0.05,colour="#7570B3") +
+  labs(title="Factors associated with telling a coach about a  \nsuspected concussion") +
+  theme(plot.title=element_text(size=12)) +
+  annotate("text",x=2,y=0.5,label="LRT: p=0.016",colour="#7570B3")
+m1_p
+ggsave("manag_p2.png",width=6,height=4,units="in")
+```
+
+Method 2: Include selected variables and apply backward elimination
+```{r Logistic_Regression_1_Multivariable_Analysis}
+
+####1. Compare models####
+toldcoach_glm_1<-glm(ConHx_ToldCoach_2019 ~ Dem_County + ConHx_yes_no + RoCKAS_CKI + RoCKAS_CAI + ConEd, data=S2_survey_src, family=binomial)
+tidy(toldcoach_glm_1,exponentiate = TRUE)
+#AIC: 150.46
+
+#Backward elimation
+toldcoach_glm_2<-toldcoach_glm_1 %>%
+  stepAIC(direction="backward",trace=FALSE)
+tidy(toldcoach_glm_2,exponentiate=TRUE)
+#AIC: 147.94
+
+#Goodness of fit
+##Model has a better fit if improves over a model with fewer variables
+##Likelihood ratio test compares the full model with the reduced model
+##H0: the reduced model is true
+##H1: the reduced model is not true
+anova(toldcoach_glm_1,toldcoach_glm_2,test="Chisq")
+lrtest(toldcoach_glm_1,toldcoach_glm_2)
+#Accept null hypothesis and use reduced model
+
+pR2(toldcoach_glm_2)
+#McFadden R2: 0.12
+
+####2. Check assumptions####
+#Assumption 1: Linearity of the logit
+#If interactions are not significant, assumption is met 
+
+S2_survey_src$RoCKAS_CKIlog<-log(S2_survey_src$RoCKAS_CKI)*S2_survey_src$RoCKAS_CKI
+
+toldcoach_glm_assump<-glm(ConHx_ToldCoach_2019 ~ ConHx_yes_no + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CKIlog, data=S2_survey_src, family=binomial)
+tidy(toldcoach_glm_assump)
+
+#Assumption 2: No outliers
+#Standardized residuals >3 suggest outliers
+plot(toldcoach_glm_2,which=4,id.n=3)
+toldcoach_glm2_data<-augment(toldcoach_glm_2) %>%
+  mutate(index=1:n())
+toldcoach_glm2_data %>% top_n(3,.cooksd)
+
+toldcoach_glm2_data$.std.resid
+toldcoach_glm2_assump_p1<-ggplot(toldcoach_glm2_data,aes(index,.std.resid))+
+  geom_point(aes(color=ConHx_ToldCoach_2019),alpha=0.5)
+
+#Assumption 3: Multicollinearity
+#VIF >5 suggests multicollinearity
+vif(toldcoach_glm_2)
+
+####3. Tables####
+toldcoach_glm_dat<-toldcoach_glm_2 %>% tidy(exponentiate=TRUE,conf.int=TRUE) %>%
+  mutate_if(is.numeric,~round(.,3)) %>%
+  unite("95% CI",conf.low:conf.high,sep="-",remove=TRUE)
+
+toldcoach_glm_dat$coef<-round(tidy(toldcoach_glm_2)$estimate,3) 
+toldcoach_glm_dat<-toldcoach_glm_dat %>% 
+  dplyr::select(term,coef,std.error,statistic,estimate,"95% CI",p.value) 
+toldcoach_glm_dat$term<-c("Intercept","History of Concussion (Yes)","Diagnosed Concussion (Yes)","Concussion Knowledge")
+toldcoach_glm_dat
+
+toldcoach_glm_ft<-flextable(toldcoach_glm_dat)
+toldcoach_glm_ft<-set_header_labels(toldcoach_glm_ft,term="Variable",coef="Beta",std.error="Standard Error",statistic="T-statistic",estimate="Odds Ratio","95% CI"="95% CI",p.value="P-value")
+toldcoach_glm_ft<-flextable::align(toldcoach_glm_ft,align="center",part="all")
+toldcoach_glm_ft<-bold(toldcoach_glm_ft,part="header")
+toldcoach_glm_ft<-border_remove(toldcoach_glm_ft)
+toldcoach_glm_ft<-hline_top(toldcoach_glm_ft,part="all",border=fp_border(width=0.5))
+toldcoach_glm_ft<-hline_bottom(toldcoach_glm_ft,border=fp_border(width=0.5))
+colformat_double(toldcoach_glm_ft,digits=2)
+toldcoach_glm_ft
+```
+
+#### Model 2: Factors associated with returning to play on the same day (max of 4 IVs)
+
+Possible IVs:
+- Level of play
+- Age
+- Number of years playing
+- Concussion history (SRC and non-SRC)
+- Diagnosis for SRC of interest
+- Concussion knowledge
+- Concussion attitude
+- Previous use of LGFA concussion education material
+
+Method 1: Examine univariate associations and only include significant variables in model (p<0.25) 
+```{r Logistic_Regression_2_Univariate_Analysis}
+
+S2_survey_src$ConHx_SameDayRTP_2019<-S2_survey_src$ConHx_SameDayRTP_2019 %>% fct_relevel("No","Yes")
+
+#Univariate analysis
+##Playing level
+m2_uni_1<-glm(ConHx_SameDayRTP_2019 ~ Dem_County, data=S2_survey_src, family=binomial)
+tidy(m2_uni_1)
+##Age
+m2_uni_2<-glm(ConHx_SameDayRTP_2019 ~ Dem_Age, data=S2_survey_src, family=binomial)
+tidy(m2_uni_2)
+##Number of years playing
+m2_uni_3<-glm(ConHx_SameDayRTP_2019 ~ Dem_Years_Play, data=S2_survey_src, family=binomial)
+tidy(m2_uni_3)
+##Concussion history
+m2_uni_4<-glm(ConHx_SameDayRTP_2019 ~ ConHx_yes_no, data=S2_survey_src, family=binomial)
+tidy(m2_uni_4)
+##Diagnosis
+m2_uni_5<-glm(ConHx_SameDayRTP_2019 ~ ConHx_Dx_2019, data=S2_survey_src, family=binomial)
+tidy(m2_uni_5)
+##Concussion knowledge
+m2_uni_6<-glm(ConHx_SameDayRTP_2019 ~ RoCKAS_CKI, data=S2_survey_src, family=binomial)
+tidy(m2_uni_6)
+##Concussion attitude
+m2_uni_7<-glm(ConHx_SameDayRTP_2019 ~ RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m2_uni_7)
+##Concussion education
+m2_uni_8<-glm(ConHx_SameDayRTP_2019 ~ ConEd, data=S2_survey_src, family=binomial)
+tidy(m2_uni_8)
+
+##Variables meeting p<0.25 cut-off:
+##Age
+##Diagnosis
+##CKI
+##CAI
+
+m2_glm_1<-glm(ConHx_SameDayRTP_2019 ~ Dem_Age + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m2_glm_1,exponentiate=TRUE)
+
+#Goodness of fit
+##Likelihood ratio test:
+##H0: there is no difference between the full and intercept only model
+##H1: there is a difference between the full and intercept only model
+m2_glm_1_intercept<-glm(ConHx_SameDayRTP_2019 ~ 1, data=S2_survey_src, family=binomial)
+lrtest(m2_glm_1,m2_glm_1_intercept)
+
+#Pseudo-R squared:
+pR2(m2_glm_1)
+
+#Assumptions
+#Outliers
+augment(m2_glm_1)$.std.resid[augment(m2_glm_1)$.std.resid>3]
+
+#Linearity of the logit
+S2_survey_src$RoCKAS_CKIlog<-log(S2_survey_src$RoCKAS_CKI)*S2_survey_src$RoCKAS_CKI
+S2_survey_src$RoCKAS_CAIlog<-log(S2_survey_src$RoCKAS_CAI)*S2_survey_src$RoCKAS_CAI
+
+m2_glm_2_assump<-glm(ConHx_SameDayRTP_2019 ~ Dem_Age + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CKIlog + RoCKAS_CAIlog, data=S2_survey_src, family=binomial)
+tidy(m2_glm_2_assump)
+
+#Multicollinearity
+vif(m2_glm_1)
+
+#Tables
+m2_glm_1_dat<-m2_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate_at(c("estimate","std.error","statistic","conf.low","conf.high"),~round(.,2)) %>%
+  unite("95CI",conf.low:conf.high,sep="-",remove=TRUE)  
+m2_glm_1_dat$coef<-round(tidy(m2_glm_1)$estimate,2)
+m2_glm_1_dat$'95CI'<-paste0("(",m2_glm_1_dat$'95CI',")")
+
+m2_glm_1_dat<-m2_glm_1_dat %>% 
+  dplyr::select(term,coef,std.error,estimate,'95CI',p.value) %>%
+  mutate_at("p.value",~round(.,3)) %>%
+  unite(odds.ratio,estimate:`95CI`,sep=" ",remove=TRUE)
+m2_glm_1_dat$term<-c("Intercept","Age","Diagnosis (yes)","Concussion knowledge","Concussion attitude")
+m2_glm_1_dat
+
+m2_glm_1_ft<-flextable(m2_glm_1_dat)
+m2_glm_1_ft<-set_header_labels(m2_glm_1_ft,term="Variable",coef="Beta",std.error="Standard Error",odds.ratio="Odds Ratio (95% CI)",p.value="P-value")
+m2_glm_1_ft<-flextable::align(m2_glm_1_ft,align="center",part="all")
+m2_glm_1_ft<-bold(m2_glm_1_ft,part="header")
+m2_glm_1_ft<-border_remove(m2_glm_1_ft)
+m2_glm_1_ft<-hline_top(m2_glm_1_ft,part="all",border=fp_border(width=0.5))
+m2_glm_1_ft<-hline_bottom(m2_glm_1_ft,border=fp_border(width=0.5))
+m2_glm_1_ft
+
+m1_m2_dat<-full_join(m1_glm_1_dat,m2_glm_1_dat)
+
+m1_m2_dat<-m1_m2_dat %>%
+  add_row(term="Told Coach",.before=1) %>%
+  add_row(term="Returned to play on the same day",.before=4)
+
+m1_m2_glm_1_ft<-flextable(m1_m2_dat)
+m1_m2_glm_1_ft<-set_header_labels(m1_m2_glm_1_ft,term="Variable",coef="Beta",std.error="Standard Error",odds.ratio="Odds Ratio (95% CI)",p.value="P-value")
+m1_m2_glm_1_ft<-flextable::align(m1_m2_glm_1_ft,align="center",part="all")
+m1_m2_glm_1_ft<-flextable::align(m1_m2_glm_1_ft,j=1,align="left")
+m1_m2_glm_1_ft<-bold(m1_m2_glm_1_ft,part="header")
+m1_m2_glm_1_ft<-italic(m1_m2_glm_1_ft,i=c(1,4))
+m1_m2_glm_1_ft<-border_remove(m1_m2_glm_1_ft)
+m1_m2_glm_1_ft<-hline_top(m1_m2_glm_1_ft,part="all",border=fp_border(width=0.5))
+m1_m2_glm_1_ft<-hline_bottom(m1_m2_glm_1_ft,border=fp_border(width=0.5))
+m1_m2_glm_1_ft<-merge_at(m1_m2_glm_1_ft,i=1,j=1:5)
+m1_m2_glm_1_ft<-merge_at(m1_m2_glm_1_ft,i=4,j=1:5)
+m1_m2_glm_1_ft<-autofit(m1_m2_glm_1_ft)
+m1_m2_glm_1_ft
+```
+
+
+```{r Logistic_Regression_2}
+
+####1. Compare models####
+SameDayRTP_glm_1<-glm(ConHx_SameDayRTP_2019 ~ ConHx_yes_no + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CAI, data=S2_survey_src, family=binomial)
+summary(SameDayRTP_glm_1)
+#AIC: 149.44
+
+#Backward elimation
+SameDayRTP_glm_2<-SameDayRTP_glm_1 %>%
+  stepAIC(direction="backward",trace=FALSE)
+tidy(SameDayRTP_glm_2,exponentiate=TRUE)
+#AIC: 145.89
+
+#Goodness of fit
+##Model has a better fit if improves over a model with fewer variables
+##Likelihood ratio test compares the full model with the reduced model
+##H0: the reduced model is true
+##H1: the reduced model is not true
+anova(SameDayRTP_glm_1,SameDayRTP_glm_2,test="Chisq")
+#Accept null hypothesis and use reduced model
+
+pR2(SameDayRTP_glm_2)
+#McFadden R2: 0.07
+
+####2. Check assumptions####
+#Assumption 1: Linearity
+SameDayRTP_glm2_assump<-glm(ConHx_SameDayRTP_2019 ~ ConHx_yes_no + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CKIlog, data=S2_survey_src, family=binomial)
+tidy(SameDayRTP_glm2_assump)
+
+#Assumption 2: No outliers
+plot(SameDayRTP_glm_2,which=4,id.n=3)
+SameDayRTP_glm2_data<-augment(SameDayRTP_glm_2) %>%
+  mutate(index=1:n())
+SameDayRTP_glm2_data %>%
+  top_n(3,.cooksd)
+
+SameDayRTP_glm2_p1<-ggplot(SameDayRTP_glm2_data,aes(index,.std.resid))+geom_point(aes(color=ConHx_SameDayRTP_2019),alpha=0.5)
+
+#Assumption 3: Multicollinearity
+vif(SameDayRTP_glm_2)
+
+####3. Tables####
+SameDayRTP_glm_dat<-SameDayRTP_glm_2 %>% tidy(exponentiate=TRUE,conf.int=TRUE) %>%
+  mutate_if(is.numeric,~round(.,3)) %>%
+  unite("95% CI",conf.low:conf.high,sep="-",remove=TRUE)
+
+SameDayRTP_glm_dat$coef<-round(tidy(SameDayRTP_glm_2)$estimate,3) 
+SameDayRTP_glm_dat<-SameDayRTP_glm_dat %>% 
+  dplyr::select(term,coef,std.error,statistic,estimate,"95% CI",p.value) 
+SameDayRTP_glm_dat$term<-c("Intercept","Diagnosed Concussion (Yes)","Concussion Attitude")
+SameDayRTP_glm_dat
+
+SameDayRTP_glm_ft<-flextable(SameDayRTP_glm_dat)
+SameDayRTP_glm_ft<-set_header_labels(SameDayRTP_glm_ft,term="Variable",coef="B",std.error="Standard Error",statistic="T-statistic",estimate="Odds Ratio","95% CI"="95% CI",p.value="P-value")
+SameDayRTP_glm_ft<-flextable::align(SameDayRTP_glm_ft,align="center",part="all")
+SameDayRTP_glm_ft<-bold(SameDayRTP_glm_ft,part="header")
+SameDayRTP_glm_ft<-border_remove(SameDayRTP_glm_ft)
+SameDayRTP_glm_ft<-hline_top(SameDayRTP_glm_ft,part="all",border=fp_border(width=0.5))
+SameDayRTP_glm_ft<-hline_bottom(SameDayRTP_glm_ft,border=fp_border(width=0.5))
+colformat_double(SameDayRTP_glm_ft,digits=2)
+SameDayRTP_glm_ft
+
+####Plots####
+m2_plot_df<-m2_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate(term=factor(term,levels=c("(Intercept)","Dem_Age","ConHx_Dx_2019Yes","RoCKAS_CKI","RoCKAS_CAI"),labels=c("Intercept","Age","Diagnosed concussion","Knowledge Score","Attitude score"))) %>%
+  mutate(estimate2=if_else(p.value<0.05,"*","")) %>%
+  slice(2:5)
+m2_plot_df
+
+m2_p<-forestplot_fun(m2_plot_df)
+m2_p<-m2_p + labs(title="Factors associated with returning to play on the same day") +
+  geom_text(aes(label=round(estimate,digits=2)),nudge_x=0.2,nudge_y=0.15,colour="#7570B3") +
+  geom_text(aes(label=estimate2),nudge_x=0.25,nudge_y=0.15,colour="#7570B3") +
+  theme(plot.title=element_text(size=12)) +
+  annotate("text",x=0.25,y=0.75,label="LRT: p=0.016",colour="#7570B3")
+m2_p
+ggsave("manag_p3.png",width=6,height=4,units="in")
+```
+
+#### Model 3: Factors associated with returning to play with symptoms (max of 4 IVs)
+
+Possible IVs:
+- Level of play
+- Age
+- Number of years playing
+- Concussion history (SRC and non-SRC)
+- Diagnosis for SRC of interest
+- Concussion knowledge
+- Concussion attitude
+- Previous use of LGFA concussion education material
+
+Method 1: Examine univariate associations and only include significant variables in model (p<0.25) 
+
+```{r Logistic_Regression_3_Univariate_Analysis}
+
+S2_survey_src$ConHx_SympRTP_2019<-S2_survey_src$ConHx_SympRTP_2019 %>% fct_relevel("No","Yes")
+
+#Univariate analysis
+##Playing level
+m3_uni_1<-glm(ConHx_SympRTP_2019 ~ Dem_County, data=S2_survey_src, family=binomial)
+tidy(m3_uni_1)
+##Age
+m3_uni_2<-glm(ConHx_SympRTP_2019 ~ Dem_Age, data=S2_survey_src, family=binomial)
+tidy(m3_uni_2)
+##Number of years played
+m3_uni_3<-glm(ConHx_SympRTP_2019 ~ Dem_Years_Play, data=S2_survey_src, family=binomial)
+tidy(m3_uni_3)
+##Concussion history
+m3_uni_4<-glm(ConHx_SympRTP_2019 ~ ConHx_yes_no, data=S2_survey_src, family=binomial)
+tidy(m3_uni_4)
+##Diagnosis
+m3_uni_5<-glm(ConHx_SympRTP_2019 ~ ConHx_Dx_2019, data=S2_survey_src, family=binomial)
+tidy(m3_uni_5)
+##Concussion knowledge
+m3_uni_6<-glm(ConHx_SympRTP_2019 ~ RoCKAS_CKI, data=S2_survey_src, family=binomial)
+tidy(m3_uni_6)
+##Concussion attitude
+m3_uni_7<-glm(ConHx_SympRTP_2019 ~ RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m3_uni_7)
+##Concussion education
+m3_uni_8<-glm(ConHx_SympRTP_2019 ~ ConEd, data=S2_survey_src, family=binomial)
+tidy(m3_uni_8)
+
+##Variables meeting p<0.25 cut-off:
+##Concussion attitude
+m3_glm_1<-glm(ConHx_SympRTP_2019 ~ RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m3_glm_1,exponentiate=TRUE)
+
+#Goodness of fit
+##Likelihood ratio test:
+#H0: there is no difference between the full and intercept only model
+#H1: there is a difference between the full and intercept only model
+m3_glm_1_intercept<-glm(ConHx_SympRTP_2019 ~ 1, data=S2_survey_src, family=binomial)
+lrtest(m3_glm_1,m3_glm_1_intercept)
+
+#Pseudo R2: 0.02
+pR2(m3_glm_1)
+
+#Assumptions:
+#Outliers
+augment(m3_glm_1)$.std.resid[augment(m3_glm_1)$.std.resid>3]
+
+#Tables
+m3_glm_1_dat<-m3_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate_at(c("estimate","std.error","statistic","conf.low","conf.high"),~round(.,2)) %>%
+  unite("95CI",conf.low:conf.high,sep="-",remove=TRUE)  
+m3_glm_1_dat$coef<-round(tidy(m3_glm_1)$estimate,2)
+m3_glm_1_dat$'95CI'<-paste0("(",m3_glm_1_dat$'95CI',")")
+
+m3_glm_1_dat<-m3_glm_1_dat %>% 
+  dplyr::select(term,coef,std.error,estimate,'95CI',p.value) %>%
+  mutate_at("p.value",~round(.,3)) %>%
+  unite(odds.ratio,estimate:`95CI`,sep=" ",remove=TRUE)
+m3_glm_1_dat$term<-c("Intercept","Concussion attitude")
+m3_glm_1_dat
+
+```
+
+
+```{r Logistic_Regression_3}
+
+####1. Compare models####
+SympRTP_glm_1<-glm(ConHx_SympRTP_2019 ~ ConHx_yes_no + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CAI, data=S2_survey_src, family=binomial)
+summary(SympRTP_glm_1)
+#AIC: 159.29
+
+#Backward elimation
+SympRTP_glm_2<-SympRTP_glm_1 %>%
+  stepAIC(direction="backward",trace=FALSE)
+tidy(SympRTP_glm_2,exponentiate=TRUE)
+#AIC: 154.69
+
+#Goodness of fit
+##Model has a better fit if improves over a model with fewer variables
+##Likelihood ratio test compares the full model with the reduced model
+##H0: the reduced model is true
+##H1: the reduced model is not true
+anova(SympRTP_glm_1,SympRTP_glm_2,test="Chisq")
+#Accept null hypothesis and use reduced model
+
+pR2(SympRTP_glm_2)
+#McFadden R2: 0.02
+
+####2. Check assumptions####
+#Assumption 1: Linearity
+S2_survey_src$RoCKAS_CAIlog<-log(S2_survey_src$RoCKAS_CAI)*S2_survey_src$RoCKAS_CAI
+
+SympRTP_glm3_assump<-glm(ConHx_SympRTP_2019 ~ Con_Hx_LGF + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CKIlog + RoCKAS_CAI + RoCKAS_CAIlog, data=S2_survey_src, family=binomial)
+summary(SympRTP_glm3_assump)
+
+#Assumption 2: No outliers
+plot(SympRTP_glm_2,which=4,id.n=3)
+SympRTP_glm3_data<-augment(SympRTP_glm_2) %>%
+  mutate(index=1:n())
+SympRTP_glm3_data %>%
+  top_n(3,.cooksd)
+
+SympRTP_glm3_p1<-ggplot(SympRTP_glm3_data,aes(index,.std.resid))+
+  geom_point(aes(color=ConHx_SympRTP_2019),alpha=0.5)
+
+####3. Tables####
+SympRTP_glm_dat<-SympRTP_glm_2 %>% tidy(exponentiate=TRUE,conf.int=TRUE) %>%
+  mutate_if(is.numeric,~round(.,3)) %>%
+  unite("95% CI",conf.low:conf.high,sep="-",remove=TRUE)
+
+SympRTP_glm_dat$coef<-round(tidy(SympRTP_glm_2)$estimate,3) 
+SympRTP_glm_dat<-SympRTP_glm_dat %>% 
+  dplyr::select(term,coef,std.error,statistic,estimate,"95% CI",p.value) 
+SympRTP_glm_dat$term<-c("Intercept","Concussion Attitude")
+SympRTP_glm_dat
+
+SympRTP_glm_ft<-flextable(SympRTP_glm_dat)
+SympRTP_glm_ft<-set_header_labels(SympRTP_glm_ft,term="Variable",coef="B",std.error="Standard Error",statistic="T-statistic",estimate="Odds Ratio","95% CI"="95% CI",p.value="P-value")
+SympRTP_glm_ft<-flextable::align(SympRTP_glm_ft,align="center",part="all")
+SympRTP_glm_ft<-bold(SympRTP_glm_ft,part="header")
+SympRTP_glm_ft<-border_remove(SympRTP_glm_ft)
+SympRTP_glm_ft<-hline_top(SympRTP_glm_ft,part="all",border=fp_border(width=0.5))
+SympRTP_glm_ft<-hline_bottom(SympRTP_glm_ft,border=fp_border(width=0.5))
+colformat_double(SympRTP_glm_ft,digits=2)
+SympRTP_glm_ft
+
+####Plots####
+m3_plot_df<-m3_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate(term=factor(term,levels=c("(Intercept)","RoCKAS_CAI"),labels=c("Intercept","Attitude Score"))) %>%
+  mutate(estimate2=if_else(p.value<0.05,"*","")) %>%
+  slice(2)
+m3_plot_df
+
+m3_p<-forestplot_fun(m3_plot_df)
+m3_p<-m3_p + labs(title="Factors associated with returning to play with symptoms") +
+    geom_text(aes(label=round(estimate,digits=2)),nudge_x=0.01,nudge_y=0.05,colour="#7570B3") +
+  geom_text(aes(label=estimate2),nudge_x=0.02,nudge_y=0.05,colour="#7570B3") +
+  theme(plot.title=element_text(size=12)) +
+  annotate("text",x=0.91,y=0.5,label="LRT: p=0.07",colour="#7570B3")
+m3_p
+ggsave("manag_p4.png",width=6,height=4,units="in")
+```
+
+#### Model 4: Factors associated with following a graded return-to-play programme (max of 4 IVs)
+
+
+Possible IVs:
+- Level of play
+- Age
+- Number of years playing
+- Concussion history (SRC and non-SRC)
+- Diagnosis for SRC of interest
+- Concussion knowledge
+- Concussion attitude
+- Previous use of LGFA concussion education material
+
+Method 1: Examine univariate associations and only include significant variables in model (p<0.25) 
+
+```{r Logistic_Regression_4_Univariate_Analysis}
+
+S2_survey_src$ConHx_RTPProg_2019<-S2_survey_src$ConHx_RTPProg_2019 %>% fct_relevel("No","Yes")
+
+#Univariate analysis
+##Playing level
+m4_uni_1<-glm(ConHx_RTPProg_2019 ~ Dem_County, data=S2_survey_src, family=binomial)
+tidy(m4_uni_1)
+##Age
+m4_uni_2<-glm(ConHx_RTPProg_2019 ~ Dem_Age, data=S2_survey_src, family=binomial)
+tidy(m4_uni_2)
+##Number of years playing
+m4_uni_3<-glm(ConHx_RTPProg_2019 ~ Dem_Years_Play, data=S2_survey_src, family=binomial)
+tidy(m4_uni_3)
+##Concussion history
+m4_uni_4<-glm(ConHx_RTPProg_2019 ~ ConHx_yes_no, data=S2_survey_src, family=binomial)
+tidy(m4_uni_4)
+##Diagnosis
+m4_uni_5<-glm(ConHx_RTPProg_2019 ~ ConHx_Dx_2019, data=S2_survey_src, family=binomial)
+tidy(m4_uni_5)
+##Concussion knowledge
+m4_uni_6<-glm(ConHx_RTPProg_2019 ~ RoCKAS_CKI, data=S2_survey_src, family=binomial)
+tidy(m4_uni_6)
+##Concussion attitude
+m4_uni_7<-glm(ConHx_RTPProg_2019 ~ RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m4_uni_7)
+##Concussion education
+m4_uni_8<-glm(ConHx_RTPProg_2019 ~ ConEd, data=S2_survey_src, family=binomial)
+tidy(m4_uni_8)
+
+##Variables meeting p<0.25 cut-off:
+##Playing level
+##Diagnosis
+##Concussion attitude
+m4_glm_1<-glm(ConHx_RTPProg_2019 ~ Dem_County + ConHx_Dx_2019 + RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m4_glm_1,exponentiate=TRUE)
+
+#Goodness of fit
+##Likelihood ratio test:
+##H0: there is no difference between the full and intercept only models
+##H1: there is a difference between the full and intercept only models
+m4_glm_1_intercept<-glm(ConHx_RTPProg_2019 ~ 1, data=S2_survey_src, family=binomial)
+lrtest(m4_glm_1,m4_glm_1_intercept)
+
+#Pseudo-R squared:
+pR2(m4_glm_1)
+
+#Tables
+m4_glm_1_dat<-m4_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate_at(c("estimate","std.error","statistic","conf.low","conf.high"),~round(.,2)) %>%
+  unite("95CI",conf.low:conf.high,sep="-",remove=TRUE)  
+m4_glm_1_dat$coef<-round(tidy(m4_glm_1)$estimate,2)
+m4_glm_1_dat$'95CI'<-paste0("(",m4_glm_1_dat$'95CI',")")
+
+m4_glm_1_dat<-m4_glm_1_dat %>% 
+  dplyr::select(term,coef,std.error,estimate,'95CI',p.value) %>%
+  mutate_at("p.value",~round(.,3)) %>%
+  unite(odds.ratio,estimate:`95CI`,sep=" ",remove=TRUE)
+m4_glm_1_dat$term<-c("Intercept","Elite level (yes)","Diagnosis","Concussion attitude")
+m4_glm_1_dat
+
+```
+
+
+```{r Logistic_Regression_4}
+
+####1. Compare models####
+RTPProg_glm_1<-glm(ConHx_RTPProg_2019 ~ ConHx_yes_no + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CAI, data=S2_survey_src, family=binomial)
+summary(RTPProg_glm_1)
+#AIC: 136.03
+
+#Backward elimation
+RTPProg_glm_2<-RTPProg_glm_1 %>%
+  stepAIC(direction="backward",trace=FALSE)
+tidy(RTPProg_glm_2,exponentiate=TRUE)
+#AIC: 133.46
+
+#Goodness of fit
+##Model has a better fit if improves over a model with fewer variables
+##Likelihood ratio test compares the full model with the reduced model
+##H0: the reduced model is true
+##H1: the reduced model is not true
+anova(RTPProg_glm_1,RTPProg_glm_2,test="Chisq")
+#Accept null hypothesis and use reduced model
+
+pR2(RTPProg_glm_2)
+#McFadden R2: 0.13
+
+####2. Check assumptions####
+#Assumption 1: Linearity
+S2_survey_src$RoCKAS_CKIlog<-log(S2_survey_src$RoCKAS_CKI)*S2_survey_src$RoCKAS_CKI
+RTPProg_glm_assump<-glm(ConHx_RTPProg_2019 ~ Con_Hx_LGF + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CKIlog + RoCKAS_CAI + RoCKAS_CKIlog, data=S2_survey_src, family=binomial)
+summary(RTPProg_glm_assump)
+
+#Assumption 2: No outliers
+plot(RTPProg_glm_2,which=4,id.n=3)
+RTPProg_glm_data<-augment(RTPProg_glm_2) %>%
+  mutate(index=1:n())
+RTPProg_glm_data %>%
+  top_n(3,.cooksd)
+
+RTPProg_glm_assump_p1<-ggplot(RTPProg_glm_data,aes(index,.std.resid))+geom_point(aes(color=ConHx_RTPProg_2019),alpha=0.5)
+
+####3. Tables####
+RTPProg_glm_dat<-RTPProg_glm_2 %>% tidy(exponentiate=TRUE,conf.int=TRUE) %>%
+  mutate_if(is.numeric,~round(.,3)) %>%
+  unite("95% CI",conf.low:conf.high,sep="-",remove=TRUE)
+
+RTPProg_glm_dat$coef<-round(tidy(RTPProg_glm_2)$estimate,3) 
+RTPProg_glm_dat<-RTPProg_glm_dat %>% 
+  dplyr::select(term,coef,std.error,statistic,estimate,"95% CI",p.value) 
+RTPProg_glm_dat$term<-c("Intercept","Diagnosed concussion","CKI","CAI")
+#RTPProg_glm_dat$p.value<-c("<0.001","<0.001")
+RTPProg_glm_dat
+
+RTPProg_glm_ft<-flextable(RTPProg_glm_dat)
+RTPProg_glm_ft<-set_header_labels(RTPProg_glm_ft,term="Variable",coef="B",std.error="Standard Error",statistic="T-statistic",estimate="Odds Ratio","95% CI"="95% CI",p.value="P-value")
+RTPProg_glm_ft<-flextable::align(RTPProg_glm_ft,align="center",part="all")
+RTPProg_glm_ft<-bold(RTPProg_glm_ft,part="header")
+RTPProg_glm_ft<-border_remove(RTPProg_glm_ft)
+RTPProg_glm_ft<-hline_top(RTPProg_glm_ft,part="all",border=fp_border(width=0.5))
+RTPProg_glm_ft<-hline_bottom(RTPProg_glm_ft,border=fp_border(width=0.5))
+colformat_double(RTPProg_glm_ft,digits=2)
+RTPProg_glm_ft
+
+####Plots####
+m4_plot_df<-m4_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate(term=factor(term,levels=c("(Intercept)","Dem_CountyYes","ConHx_Dx_2019Yes","RoCKAS_CAI"),labels=c("Intercept","Elite Level","Diagnosed Concussion","Attitude Score"))) %>%
+  mutate(estimate2=if_else(p.value<0.05,"*","")) %>%
+  slice(2:4)
+m4_plot_df
+
+m4_p<-forestplot_fun(m4_plot_df)
+m4_p<-m4_p + labs(title="Factors associated with following a graded RTP \nprogramme") +
+  geom_text(aes(label=round(estimate,digits=2)),nudge_x=0.55,nudge_y=0.15,colour="#7570B3") +
+  geom_text(aes(label=estimate2),nudge_x=1.1,nudge_y=0.15,colour="#7570B3") +
+  theme(plot.title=element_text(size=12)) +
+  annotate("text",x=12,y=0.7,label="LRT: p<0.001",colour="#7570B3")
+m4_p
+ggsave("manag_p5.png",width=6,height=4,units="in")
+```
+
+#### Model 5: Factors associated with following a graded RTP programme with medical supervision (max of 3 IVs)
+
+Possible IVs:
+- Level of play
+- Age
+- Number of years playing
+- Concussion history (SRC and non-SRC)
+- Diagnosis for SRC of interest
+- Concussion knowledge
+- Concussion attitude
+- Previous use of LGFA concussion education material
+
+Method 1: Examine univariate associations and only include significant variables in model (p<0.25) 
+
+```{r Logistic_Regression_5_Univariate_Analysis}
+
+S2_survey_src$ConHx_RTPMedSup_2019<-S2_survey_src$ConHx_RTPMedSup_2019 %>% fct_relevel("No","Yes")
+
+#Univariate analysis
+##Playing level
+m5_uni_1<-glm(ConHx_RTPMedSup_2019 ~ Dem_County, data=S2_survey_src, family=binomial)
+tidy(m5_uni_1)
+##Age
+m5_uni_2<-glm(ConHx_RTPMedSup_2019 ~ Dem_Age, data=S2_survey_src, family=binomial)
+tidy(m5_uni_2,exponentiate=TRUE)
+##Number of years playing
+m5_uni_3<-glm(ConHx_RTPMedSup_2019 ~ Dem_Years_Play, data=S2_survey_src, family=binomial)
+tidy(m5_uni_3,exponentiate=TRUE)
+##Concussion history
+m5_uni_4<-glm(ConHx_RTPMedSup_2019 ~ ConHx_yes_no, data=S2_survey_src, family=binomial)
+tidy(m5_uni_4,exponentiate=TRUE)
+##Diagnosis
+m5_uni_5<-glm(ConHx_RTPMedSup_2019 ~ ConHx_Dx_2019, data=S2_survey_src, family=binomial)
+tidy(m5_uni_5,exponentiate=TRUE)
+##Concussion knowledge
+m5_uni_6<-glm(ConHx_RTPMedSup_2019 ~ RoCKAS_CKI, data=S2_survey_src, family=binomial)
+tidy(m5_uni_6,exponentiate=TRUE)
+##Concussion attitude
+m5_uni_7<-glm(ConHx_RTPMedSup_2019 ~ RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m5_uni_7,exponentiate=TRUE)
+##Concussion education
+m5_uni_8<-glm(ConHx_RTPMedSup_2019 ~ ConEd, data=S2_survey_src, family=binomial)
+tidy(m5_uni_8,exponentiate=TRUE)
+
+##Variables meeting p<0.25 cut-off:
+##Playing level
+##Number of years playing
+##Diagnosis
+
+m5_glm_1<-glm(ConHx_RTPMedSup_2019 ~ Dem_County + Dem_Years_Play + ConHx_Dx_2019, data=S2_survey_src, family=binomial)
+tidy(m5_glm_1,exponentiate=TRUE)
+
+#Goodness of fit
+##Likelihood ratio test:
+#H0: there is no difference between the full and intercept only model
+#H1: there is a difference between the full and intercept only model
+m5_glm_1_intercept<-glm(ConHx_RTPMedSup_2019 ~ 1, data=S2_survey_src, family=binomial)
+lrtest(m5_glm_1,m5_glm_1_intercept)
+
+#Pseudo-R squared:
+pR2(m5_glm_1)
+
+#Tables
+m5_glm_1_dat<-m5_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate_at(c("estimate","std.error","statistic","conf.low","conf.high"),~round(.,2)) %>%
+  unite("95CI",conf.low:conf.high,sep="-",remove=TRUE)  
+m5_glm_1_dat$coef<-round(tidy(m5_glm_1)$estimate,2)
+m5_glm_1_dat$'95CI'<-paste0("(",m5_glm_1_dat$'95CI',")")
+
+m5_glm_1_dat<-m5_glm_1_dat %>% 
+  dplyr::select(term,coef,std.error,estimate,'95CI',p.value) %>%
+  mutate_at("p.value",~round(.,3)) %>%
+  unite(odds.ratio,estimate:`95CI`,sep=" ",remove=TRUE)
+m5_glm_1_dat$term<-c("Intercept","Elite level","Number of Years Played","Diagnosis (yes)")
+m5_glm_1_dat
+
+```
+
+
+```{r Logistic_Regression_5}
+
+####1. Compare models####
+RTPMedSup_glm_1<-glm(ConHx_RTPMedSup_2019 ~ ConHx_yes_no + ConHx_Dx_2019 + RoCKAS_CAI, data=S2_survey_src, family=binomial)
+summary(RTPMedSup_glm_1)
+#AIC: 121.73
+
+#Backward elimation
+RTPMedSup_glm_2<-RTPMedSup_glm_1 %>%
+  stepAIC(direction="backward",trace=FALSE)
+tidy(RTPMedSup_glm_2,exponentiate=TRUE)
+#AIC: 119.76
+
+#Goodness of fit
+##Model has a better fit if improves over a model with fewer variables
+##Likelihood ratio test compares the full model with the reduced model
+##H0: the reduced model is true
+##H1: the reduced model is not true
+anova(RTPMedSup_glm_1,RTPMedSup_glm_2,test="Chisq")
+#Accept null hypothesis and use reduced model
+
+pR2(RTPMedSup_glm_2)
+#McFadden R2: 0.15
+
+####2. Check assumptions####
+#Assumption 1: Linearity
+RTPMedSup_glm_assump<-glm(ConHx_RTPMedSup_2019 ~ Con_Hx_LGF + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CKIlog + RoCKAS_CAI + RoCKAS_CAIlog, data=S2_survey_src, family=binomial)
+
+#Assumption 2: No outliers
+plot(RTPMedSup_glm_2,which=4,id.n=3)
+RTPMedSup_glm_data<-augment(RTPMedSup_glm_2) %>%
+  mutate(index=1:n())
+RTPMedSup_glm_data %>%
+  top_n(3,.cooksd)
+
+RTPMedSup_glm_assump_p1<-ggplot(RTPMedSup_glm_data,aes(index,.std.resid))+
+  geom_point(aes(color=ConHx_ToldCoach_2019),alpha=0.5)
+
+####3. Tables####
+RTPMedSup_glm_dat<-RTPMedSup_glm_2 %>% tidy(exponentiate=TRUE,conf.int=TRUE) %>%
+  mutate_if(is.numeric,~round(.,3)) %>%
+  unite("95% CI",conf.low:conf.high,sep="-",remove=TRUE)
+
+RTPMedSup_glm_dat$coef<-round(tidy(RTPMedSup_glm_2)$estimate,3) 
+RTPMedSup_glm_dat$p.value<-c("<0.001","<0.001")
+RTPMedSup_glm_dat<-RTPMedSup_glm_dat %>% 
+  dplyr::select(term,coef,std.error,statistic,estimate,"95% CI",p.value) 
+RTPMedSup_glm_dat$term<-c("Intercept","Diagnosed Concussion (Yes)")
+RTPMedSup_glm_dat
+
+RTPMedSup_glm_ft<-flextable(RTPMedSup_glm_dat)
+RTPMedSup_glm_ft<-set_header_labels(RTPMedSup_glm_ft,term="Variable",coef="B",std.error="Standard Error",statistic="T-statistic",estimate="Odds Ratio","95% CI"="95% CI",p.value="P-value")
+RTPMedSup_glm_ft<-flextable::align(RTPMedSup_glm_ft,align="center",part="all")
+RTPMedSup_glm_ft<-bold(RTPMedSup_glm_ft,part="header")
+RTPMedSup_glm_ft<-border_remove(RTPMedSup_glm_ft)
+RTPMedSup_glm_ft<-hline_top(RTPMedSup_glm_ft,part="all",border=fp_border(width=0.5))
+RTPMedSup_glm_ft<-hline_bottom(RTPMedSup_glm_ft,border=fp_border(width=0.5))
+colformat_double(RTPMedSup_glm_ft,digits=2)
+RTPMedSup_glm_ft
+
+####Plots####
+m5_plot_df<-m5_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate(term=factor(term,levels=c("(Intercept)","Dem_CountyYes","Dem_Years_Play","ConHx_Dx_2019Yes"),labels=c("Intercept","Elite Level","Number of Years Played","Diagnosed Concussion"))) %>%
+  mutate(estimate2=if_else(p.value<0.05,"*","")) %>%
+  slice(2:4)
+m5_plot_df
+
+m5_p<-forestplot_fun(m5_plot_df)
+m5_p<-m5_p + 
+  geom_text(aes(label=round(estimate,digits=2)),nudge_x=2,nudge_y=0.15,colour="#7570B3") +
+  geom_text(aes(label=estimate2),nudge_x=4.1,nudge_y=0.15,colour="#7570B3") +
+  labs(title="Factors associated with following a graded RTP \nprogramme with medical supervision") +
+  theme(plot.title=element_text(size=12)) +
+  annotate("text",x=35,y=3,label="LRT: p<0.001",colour="#7570B3")
+m5_p
+ggsave("manag_p6.png",width=6,height=4,units="in")
+```
+
+#### Model 6: Factors associated with receiving medical clearance before returning to play (2-3 IVs)
+
+Possible IVs:
+- Level of play
+- Age
+- Number of years playing
+- Concussion history (SRC and non-SRC)
+- Diagnosis for SRC of interest
+- Concussion knowledge
+- Concussion attitude
+- Previous use of LGFA concussion education material
+
+Method 1: Examine univariate associations and only include significant variables in model (p<0.25) 
+
+```{r Logistic_Regression_6_Univariate_Analysis}
+
+S2_survey_src$ConHx_MedClear_2019<-S2_survey_src$ConHx_MedClear_2019 %>% fct_relevel("No","Yes")
+
+#Univariate analysis
+##Playing level
+m6_uni_1<-glm(ConHx_MedClear_2019 ~ Dem_County, data=S2_survey_src, family=binomial)
+tidy(m6_uni_1)
+##Age
+m6_uni_2<-glm(ConHx_MedClear_2019 ~ Dem_Age, data=S2_survey_src, family=binomial)
+tidy(m6_uni_2)
+##Number of years playing
+m6_uni_3<-glm(ConHx_MedClear_2019 ~ Dem_Years_Play, data=S2_survey_src, family=binomial)
+tidy(m6_uni_3)
+##Concussion history
+m6_uni_4<-glm(ConHx_MedClear_2019 ~ ConHx_yes_no, data=S2_survey_src, family=binomial)
+tidy(m6_uni_4)
+##Diagnosis
+m6_uni_5<-glm(ConHx_MedClear_2019 ~ ConHx_Dx_2019, data=S2_survey_src, family=binomial)
+tidy(m6_uni_5)
+##Concussion knowledge
+m6_uni_6<-glm(ConHx_MedClear_2019 ~ RoCKAS_CKI, data=S2_survey_src, family=binomial)
+tidy(m6_uni_6)
+##Concussion attitude
+m6_uni_7<-glm(ConHx_MedClear_2019 ~ RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m6_uni_7)
+##Concussion education
+m6_uni_8<-glm(ConHx_MedClear_2019 ~ ConEd, data=S2_survey_src, family=binomial)
+tidy(m6_uni_8)
+
+##Variables meeting p<0.25 cut-off:
+##Playing level
+##Age
+##Diagnosis
+##CKI
+
+#Only 2-3 variables allowed
+m6_glm_1<-glm(ConHx_MedClear_2019 ~ Dem_County + ConHx_Dx_2019 + RoCKAS_CKI, data=S2_survey_src, family=binomial)
+tidy(m6_glm_1,exponentiate=TRUE)
+
+#Goodness of fit
+##Likelihood ratio test:
+#H0: there is no difference between the full and intercept only model
+#H1: there is a difference between the full and intercept only model
+m6_glm_1_intercept<-glm(ConHx_MedClear_2019 ~ 1, data=S2_survey_src, family=binomial)
+lrtest(m6_glm_1,m6_glm_1_intercept)
+
+#Pseudo-R squared:
+pR2(m6_glm_1)
+
+#Tables
+m6_glm_1_dat<-m6_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate_at(c("estimate","std.error","statistic","conf.low","conf.high"),~round(.,2)) %>%
+  unite("95CI",conf.low:conf.high,sep="-",remove=TRUE)  
+m6_glm_1_dat$coef<-round(tidy(m6_glm_1)$estimate,2)
+m6_glm_1_dat$'95CI'<-paste0("(",m6_glm_1_dat$'95CI',")")
+
+m6_glm_1_dat<-m6_glm_1_dat %>% 
+  dplyr::select(term,coef,std.error,estimate,'95CI',p.value) %>%
+  mutate_at("p.value",~round(.,3)) %>%
+  unite(odds.ratio,estimate:`95CI`,sep=" ",remove=TRUE)
+m6_glm_1_dat$term<-c("Intercept","Elite level (yes)","Diagnosis (yes)","Concussion knowledge")
+m6_glm_1_dat
+
+```
+
+
+```{r Logistic_Regression_6}
+
+####1. Compare models####
+MedClear_glm_1<-glm(ConHx_MedClear_2019 ~ ConHx_yes_no + ConHx_Dx_2019 + RoCKAS_CAI, data=S2_survey_src, family=binomial)
+summary(MedClear_glm_1)
+#AIC: 115.24
+
+#Backward elimation
+MedClear_glm_2<-MedClear_glm_1 %>%
+  stepAIC(direction="backward",trace=FALSE)
+tidy(MedClear_glm_2,exponentiate=TRUE)
+#AIC: 113.28
+
+#Goodness of fit
+##Model has a better fit if improves over a model with fewer variables
+##Likelihood ratio test compares the full model with the reduced model
+##H0: the reduced model is true
+##H1: the reduced model is not true
+anova(MedClear_glm_1,MedClear_glm_2,test="Chisq")
+#Accept null hypothesis and use reduced model
+
+pR2(MedClear_glm_2)
+#McFadden R2: 0.15
+
+####2. Check assumptions####
+#Assumption 1: Linearity
+MedClear_glm_assump<-glm(ConHx_MedClear_2019 ~ Con_Hx_LGF + ConHx_Dx_2019 + RoCKAS_CKI + RoCKAS_CKIlog + RoCKAS_CAI + RoCKAS_CAIlog, data=S2_survey_src, family=binomial)
+
+#Assumption 2: No outliers
+plot(MedClear_glm_2,which=4,id.n=3)
+MedClear_glm_data<-augment(MedClear_glm_2) %>%
+  mutate(index=1:n())
+MedClear_glm_data %>%
+  top_n(3,.cooksd)
+
+MedClear_glm_assump_p1<-ggplot(MedClear_glm_data,aes(index,.std.resid))+
+  geom_point(aes(color=ConHx_MedClear_2019),alpha=0.5)
+
+####3. Tables####
+MedClear_glm_dat<-MedClear_glm_2 %>% tidy(exponentiate=TRUE,conf.int=TRUE) %>%
+  mutate_if(is.numeric,~round(.,3)) %>%
+  unite("95% CI",conf.low:conf.high,sep="-",remove=TRUE)
+
+MedClear_glm_dat$coef<-round(tidy(MedClear_glm_2)$estimate,3) 
+MedClear_glm_dat$p.value<-c("<0.001","<0.001")
+MedClear_glm_dat<-MedClear_glm_dat %>% 
+  dplyr::select(term,coef,std.error,statistic,estimate,"95% CI",p.value) 
+MedClear_glm_dat$term<-c("Intercept","Diagnosed Concussion (Yes)")
+MedClear_glm_dat
+
+MedClear_glm_ft<-flextable(MedClear_glm_dat)
+MedClear_glm_ft<-set_header_labels(MedClear_glm_ft,term="Variable",coef="B",std.error="Standard Error",statistic="T-statistic",estimate="Odds Ratio","95% CI"="95% CI",p.value="P-value")
+MedClear_glm_ft<-flextable::align(MedClear_glm_ft,align="center",part="all")
+MedClear_glm_ft<-bold(MedClear_glm_ft,part="header")
+MedClear_glm_ft<-border_remove(MedClear_glm_ft)
+MedClear_glm_ft<-hline_top(MedClear_glm_ft,part="all",border=fp_border(width=0.5))
+MedClear_glm_ft<-hline_bottom(MedClear_glm_ft,border=fp_border(width=0.5))
+colformat_double(MedClear_glm_ft,digits=2)
+MedClear_glm_ft
+
+####Plots####
+m6_plot_df<-m6_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate(term=factor(term,levels=c("(Intercept)","Dem_CountyYes","ConHx_Dx_2019Yes","RoCKAS_CKI"),labels=c("Intercept","Elite Level","Diagnosed Concussion","Knowledge Score"))) %>%
+  mutate(estimate2=if_else(p.value<0.05,"*","")) %>%
+  slice(2:4)
+m6_plot_df
+
+m6_p<-forestplot_fun(m6_plot_df)
+m6_p<-m6_p + 
+  geom_text(aes(label=round(estimate,digits=2)),nudge_x=3.5,nudge_y=0.15,colour="#7570B3") +
+  geom_text(aes(label=estimate2),nudge_x=7.4,nudge_y=0.15,colour="#7570B3") +
+  labs(title="Factors associated with receiving medical clearance \nbefore RTP") +
+  theme(plot.title=element_text(size=12)) +
+  annotate("text",x=65,y=3.25,label="LRT: p<0.001",colour="#7570B3")
+m6_p
+ggsave("manag_p7.png",width=6,height=4,units="in")
+```
+
+### Model 7: Factors associated with following a return-to-school programme (max of 1-2 IVs)
+
+Possible IVs:
+- Level of play
+- Age
+- Number of years playing
+- Concussion history (SRC and non-SRC)
+- Diagnosis for SRC of interest
+- Concussion knowledge
+- Concussion attitude
+- Previous use of LGFA concussion education material
+
+Method 1: Examine univariate associations and only include significant variables in model (p<0.25)
+
+```{r Logistic_Regression_7_Univariate_Analysis}
+
+S2_survey_src$ConHx_RTS_2019<-S2_survey_src$ConHx_RTS_2019 %>% fct_relevel("No","Yes")
+
+#Univariate analysis
+##Playing level
+m7_uni_1<-glm(ConHx_RTS_2019 ~ Dem_County, data=S2_survey_src, family=binomial)
+tidy(m7_uni_1)
+##Age
+m7_uni_2<-glm(ConHx_RTS_2019 ~ Dem_Age, data=S2_survey_src, family=binomial)
+tidy(m7_uni_2)
+##Number of years playing
+m7_uni_3<-glm(ConHx_RTS_2019 ~ Dem_Years_Play, data=S2_survey_src, family=binomial)
+tidy(m7_uni_3)
+##Concussion history
+m7_uni_4<-glm(ConHx_RTS_2019 ~ ConHx_yes_no, data=S2_survey_src, family=binomial)
+tidy(m7_uni_4)
+##Diagnosis
+m7_uni_5<-glm(ConHx_RTS_2019 ~ ConHx_Dx_2019, data=S2_survey_src, family=binomial)
+tidy(m7_uni_5)
+##Concussion knowledge
+m7_uni_6<-glm(ConHx_RTS_2019 ~ RoCKAS_CKI, data=S2_survey_src, family=binomial)
+tidy(m7_uni_6)
+##Concussion attitude
+m7_uni_7<-glm(ConHx_RTS_2019 ~ RoCKAS_CAI, data=S2_survey_src, family=binomial)
+tidy(m7_uni_7)
+##Concussion education
+m7_uni_8<-glm(ConHx_RTS_2019 ~ ConEd, data=S2_survey_src, family=binomial)
+tidy(m7_uni_8)
+
+##Variables meeting p<0.25 cut-off:
+##Diagnosis
+##Concussion knowledge
+##Concussion education
+
+#1-2 variables allowed
+m7_glm_1<-glm(ConHx_RTS_2019 ~ ConHx_Dx_2019 + ConEd, data=S2_survey_src, family=binomial)
+tidy(m7_glm_1,exponentiate=TRUE)
+
+#Goodness of fit
+##Likelihood ratio test:
+#H0: there is no difference between the full and intercept only models
+#H1: there is a difference between the full and intercept only models
+m7_glm_1_intercept<-glm(ConHx_RTS_2019 ~ 1, data=S2_survey_src, family=binomial)
+lrtest(m7_glm_1,m7_glm_1_intercept)
+
+#Pseudo-R squared:
+pR2(m7_glm_1)
+
+#Tables:
+m7_glm_1_dat<-m7_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate_at(c("estimate","std.error","statistic","conf.low","conf.high"),~round(.,2)) %>%
+  unite("95CI",conf.low:conf.high,sep="-",remove=TRUE)  
+m7_glm_1_dat$coef<-round(tidy(m7_glm_1)$estimate,2)
+m7_glm_1_dat$'95CI'<-paste0("(",m7_glm_1_dat$'95CI',")")
+
+m7_glm_1_dat<-m7_glm_1_dat %>% 
+  dplyr::select(term,coef,std.error,estimate,'95CI',p.value) %>%
+  mutate_at("p.value",~round(.,3)) %>%
+  unite(odds.ratio,estimate:`95CI`,sep=" ",remove=TRUE)
+m7_glm_1_dat$term<-c("Intercept","Diagnosis (yes)","Concussion education (yes)")
+m7_glm_1_dat
+
+m3_m4<-full_join(m3_glm_1_dat,m4_glm_1_dat)
+m3_m5<-full_join(m3_m4,m5_glm_1_dat)
+m3_m6<-full_join(m3_m5,m6_glm_1_dat)
+m3_m7<-full_join(m3_m6,m7_glm_1_dat)
+
+m3_m7<-m3_m7 %>% 
+  add_row(term="Returning to Play with Symptoms",.before=1) %>% 
+  add_row(term="Followed a Graded Return to Play Programme",.before=4) %>%
+  add_row(term="Followed a Graded Return to Play with Medical Supervision",.before=9) %>%
+  add_row(term="Received Medical Clearance",.before=14) %>%
+  add_row(term="Followed a Return to School Programme",.before=19)
+
+m3_m7_glm_1_ft<-flextable(m3_m7)
+m3_m7_glm_1_ft<-set_header_labels(m3_m7_glm_1_ft,term="Variable",coef="Beta",std.error="Standard Error",odds.ratio="Odds Ratio (95% CI)",p.value="P-value")
+m3_m7_glm_1_ft<-flextable::align(m3_m7_glm_1_ft,align="center",part="all")
+m3_m7_glm_1_ft<-flextable::align(m3_m7_glm_1_ft,j=1,align="left")
+m3_m7_glm_1_ft<-bold(m3_m7_glm_1_ft,part="header")
+m3_m7_glm_1_ft<-italic(m3_m7_glm_1_ft,i=c(1,4,9,14,19),j=1)
+m3_m7_glm_1_ft<-border_remove(m3_m7_glm_1_ft)
+m3_m7_glm_1_ft<-hline_top(m3_m7_glm_1_ft,part="all",border=fp_border(width=0.5))
+m3_m7_glm_1_ft<-hline_bottom(m3_m7_glm_1_ft,border=fp_border(width=0.5))
+m3_m7_glm_1_ft<-merge_at(m3_m7_glm_1_ft,i=1,j=1:5)
+m3_m7_glm_1_ft<-merge_at(m3_m7_glm_1_ft,i=4,j=1:5)
+m3_m7_glm_1_ft<-merge_h_range(m3_m7_glm_1_ft,i=c(1,4,9,14,19),j1=1,j2=5)
+m3_m7_glm_1_ft<-autofit(m3_m7_glm_1_ft)
+m3_m7_glm_1_ft
+
+####Plots####
+m7_plot_df<-m7_glm_1 %>%
+  tidy(conf.int=TRUE,exponentiate=TRUE) %>%
+  mutate(term=factor(term,levels=c("(Intercept)","ConHx_Dx_2019Yes","ConEdYes"),labels=c("Intercept","Diagnosed Concussion","Concussion Education"))) %>%
+  mutate(estimate2=if_else(p.value<0.05,"*","")) %>%
+  slice(2:3)
+m7_plot_df
+
+m7_p<-forestplot_fun(m7_plot_df)
+m7_p<-m7_p + 
+  geom_text(aes(label=round(estimate,digits=2)),nudge_x=1,nudge_y=0.1,colour="#7570B3") +
+  geom_text(aes(label=estimate2),nudge_x=1.4,nudge_y=0.1,colour="#7570B3") +
+  labs(title="Factors associated with following a RTS programme") +
+  theme(plot.title=element_text(size=12)) +
+  annotate("text",x=12.5,y=0.6,label="LRT: p=0.07",colour="#7570B3")
+m7_p
+ggsave("manag_p8.png",width=6,height=4,units="in")
+```
+
+
+```{r Logistic_Regression_7}
+
+RTS_glm_1<-glm(ConHx_RTS_2019 ~ ConHx_yes_no + ConHx_Dx_2019, data=S2_survey_src, family=binomial)
+summary(RTS_glm_1)
+#AIC: 101.11
+
+RTS_glm_2<-RTS_glm_1 %>%
+  stepAIC(direction="backward",trace=FALSE)
+tidy(RTS_glm_2,exponentiate=TRUE)
+##AIC: 99.3
+
+pR2(RTS_glm_1)
+#McFadden R2: 0.048
+
+RTS_glm_dat<-RTS_glm_1 %>% 
+  tidy(exponentiate=TRUE,conf.int=TRUE) %>%
+  mutate_if(is.numeric,~round(.,3)) %>%
+  unite("95% CI",conf.low:conf.high,sep="-",remove=TRUE)
+
+RTS_glm_dat$coef<-round(tidy(RTS_glm_1)$estimate,3) 
+RTS_glm_dat<-RTS_glm_dat %>% 
+  dplyr::select(term,coef,std.error,statistic,estimate,"95% CI",p.value) 
+RTS_glm_dat$term<-c("Intercept","Concussion history","Diagnosed Concussion (Yes)")
+RTS_glm_dat
+
+RTS_glm_ft<-flextable(RTS_glm_dat)
+RTS_glm_ft<-set_header_labels(RTS_glm_ft,term="Variable",coef="B",std.error="Standard Error",statistic="T-statistic",estimate="Odds Ratio","95% CI"="95% CI",p.value="P-value")
+RTS_glm_ft<-flextable::align(RTS_glm_ft,align="center",part="all")
+RTS_glm_ft<-bold(RTS_glm_ft,part="header")
+RTS_glm_ft<-border_remove(RTS_glm_ft)
+RTS_glm_ft<-hline_top(RTS_glm_ft,part="all",border=fp_border(width=0.5))
+RTS_glm_ft<-hline_bottom(RTS_glm_ft,border=fp_border(width=0.5))
+colformat_double(RTS_glm_ft,digits=2)
+RTS_glm_ft
+
+logreg_t1<-rbind(toldcoach_glm_dat,SameDayRTP_glm_dat,SympRTP_glm_dat,RTPProg_glm_dat,RTPMedSup_glm_dat,MedClear_glm_dat)
+Outcome<-c("Informed a coach","","","","Returned to play on the same day","","","Returned to play with symptoms","","Followed an RTP Programme","","Followed an RTP with medical supervision","","Received medical clearance before full RTP","")
+#logreg_t1<-cbind(Outcome,logreg_t1)
+
+logreg_ft1<-flextable(logreg_t1)
+#logreg_ft1<-set_header_labels(logreg_ft1,Outcome="Outcome",term="Variable",coef="B",std.error="Standard Error",statistic="T-statistic",estimate="Odds Ratio","95% CI"="95% CI",p.value="P-value")
+logreg_ft1<-border_remove(logreg_ft1)
+logreg_ft1<-flextable::align(logreg_ft1,align="center",part="all")
+logreg_ft1<-bold(logreg_ft1,part="header")
+logreg_ft1<-hline_top(logreg_ft1,part="all",border=fp_border(width=0.5))
+logreg_ft1
+
+```
+
+
+```{r Save_tables }
+
+####Save tables####
+Paper2_tables<-read_docx()
+Paper2_tables<-body_add_flextable(Paper2_tables,dem_t1)
+Paper2_tables<-body_add_par(Paper2_tables,value=" ")
+
+Paper2_tables<-body_add_flextable(Paper2_tables,mn_1_ft)
+Paper2_tables<-body_add_par(Paper2_tables,value=" ")
+
+Paper2_tables<-body_add_flextable(Paper2_tables,m1_m2_glm_1_ft)
+Paper2_tables<-body_add_par(Paper2_tables,value=" ")
+
+Paper2_tables<-body_add_flextable(Paper2_tables,m3_m7_glm_1_ft)
+Paper2_tables<-body_add_par(Paper2_tables,value=" ")
+
+#print(Paper2_tables,target="Paper2_tables.docx")
+```
+
